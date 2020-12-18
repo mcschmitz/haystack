@@ -451,16 +451,17 @@ class DensePassageRetriever(BaseRetriever):
 
 
 class EmbeddingRetriever(BaseRetriever):
+
     def __init__(
-        self,
-        document_store: BaseDocumentStore,
-        embedding_model: str,
-        model_version: Optional[str] = None,
-        use_gpu: bool = True,
-        model_format: str = "farm",
-        pooling_strategy: str = "reduce_mean",
-        emb_extraction_layer: int = -1,
-        top_k: int = 10,
+            self,
+            embedding_model: Union[str, object],
+            document_store: BaseDocumentStore,
+            model_version: Optional[str] = None,
+            use_gpu: bool = True,
+            model_format: str = "farm",
+            pooling_strategy: str = "reduce_mean",
+            emb_extraction_layer: int = -1,
+            top_k: int = 10,
     ):
         """
         :param document_store: An instance of DocumentStore from which to retrieve documents.
@@ -497,8 +498,9 @@ class EmbeddingRetriever(BaseRetriever):
         self.emb_extraction_layer = emb_extraction_layer
         self.top_k = top_k
 
-        logger.info(f"Init retriever using embeddings of model {embedding_model}")
         if model_format == "farm" or model_format == "transformers":
+            logger.info(
+                f"Init retriever using embeddings of model {embedding_model}")
             self.embedding_model = Inferencer.load(
                 embedding_model, revision=model_version, task_type="embeddings", extraction_strategy=self.pooling_strategy,
                 extraction_layer=self.emb_extraction_layer, gpu=use_gpu, batch_size=4, max_seq_len=512, num_processes=0
@@ -517,6 +519,8 @@ class EmbeddingRetriever(BaseRetriever):
 
 
         elif model_format == "sentence_transformers":
+            logger.info(
+                f"Init retriever using embeddings of model {embedding_model}")
             try:
                 from sentence_transformers import SentenceTransformer
             except ImportError:
@@ -535,9 +539,12 @@ class EmbeddingRetriever(BaseRetriever):
                     f"You are using a Sentence Transformer with the {document_store.similarity} function. "
                     f"We recommend using cosine instead. "
                     f"This can be set when initializing the DocumentStore")
+        elif model_format == "self-written":
+            logger.info(
+                f"Init retriever using embeddings of model {type(embedding_model).__name__}")
+            self.embedding_model = embedding_model
         else:
             raise NotImplementedError
-
     def retrieve(self, query: str, filters: dict = None, top_k: Optional[int] = None, index: str = None) -> List[Document]:
         """
         Scan through documents in DocumentStore and return a small number documents
@@ -580,6 +587,9 @@ class EmbeddingRetriever(BaseRetriever):
             # get back list of numpy embedding vectors
             emb = self.embedding_model.encode(texts, batch_size=200, show_progress_bar=False)
             emb = [r for r in emb]
+        elif self.model_format == "self-written":
+            pred = self.embedding_model.predict(texts)
+            emb = [p for p in pred]
         return emb
 
     def embed_queries(self, texts: List[str]) -> List[np.ndarray]:
