@@ -375,7 +375,7 @@ class EmbeddingRetriever(BaseRetriever):
     def __init__(
         self,
         document_store: BaseDocumentStore,
-        embedding_model: str,
+        embedding_model: Union[str, object],
         use_gpu: bool = True,
         model_format: str = "farm",
         pooling_strategy: str = "reduce_mean",
@@ -405,8 +405,9 @@ class EmbeddingRetriever(BaseRetriever):
         self.pooling_strategy = pooling_strategy
         self.emb_extraction_layer = emb_extraction_layer
 
-        logger.info(f"Init retriever using embeddings of model {embedding_model}")
         if model_format == "farm" or model_format == "transformers":
+            logger.info(
+                f"Init retriever using embeddings of model {embedding_model}")
             self.embedding_model = Inferencer.load(
                 embedding_model, task_type="embeddings", extraction_strategy=self.pooling_strategy,
                 extraction_layer=self.emb_extraction_layer, gpu=use_gpu, batch_size=4, max_seq_len=512, num_processes=0
@@ -425,6 +426,8 @@ class EmbeddingRetriever(BaseRetriever):
 
 
         elif model_format == "sentence_transformers":
+            logger.info(
+                f"Init retriever using embeddings of model {embedding_model}")
             try:
                 from sentence_transformers import SentenceTransformer
             except ImportError:
@@ -443,6 +446,10 @@ class EmbeddingRetriever(BaseRetriever):
                     f"You are using a Sentence Transformer with the {document_store.similarity} function. "
                     f"We recommend using cosine instead. "
                     f"This can be set when initializing the DocumentStore")
+        elif model_format == "self-written":
+            logger.info(
+                f"Init retriever using embeddings of model {type(embedding_model).__name__}")
+            self.embedding_model = embedding_model
         else:
             raise NotImplementedError
 
@@ -486,6 +493,9 @@ class EmbeddingRetriever(BaseRetriever):
             # get back list of numpy embedding vectors
             emb = self.embedding_model.encode(texts)
             emb = [r for r in emb]
+        elif self.model_format == "self-written":
+            pred = self.embedding_model.predict(texts)
+            emb = [p for p in pred]
         return emb
 
     def embed_queries(self, texts: List[str]) -> List[np.array]:
