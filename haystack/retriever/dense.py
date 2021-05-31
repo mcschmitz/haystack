@@ -4,11 +4,11 @@ import torch
 import numpy as np
 from pathlib import Path
 from tqdm.auto import tqdm
-
+from torch import nn
 from haystack.document_store.base import BaseDocumentStore
 from haystack import Document
 from haystack.retriever.base import BaseRetriever
-
+from transformers import AutoTokenizer
 from farm.infer import Inferencer
 from farm.modeling.tokenization import Tokenizer
 from farm.modeling.language_model import LanguageModel
@@ -35,8 +35,10 @@ class DensePassageRetriever(BaseRetriever):
 
     def __init__(self,
                  document_store: BaseDocumentStore,
-                 query_embedding_model: Union[Path, str] = "facebook/dpr-question_encoder-single-nq-base",
-                 passage_embedding_model: Union[Path, str] = "facebook/dpr-ctx_encoder-single-nq-base",
+                 query_embedding_model: Union[Path, str, object
+                 ] = "facebook/dpr-question_encoder-single-nq-base",
+                 passage_embedding_model: Union[Path, str, object] =
+                 "facebook/dpr-ctx_encoder-single-nq-base",
                  single_model_path: Optional[Union[Path, str]] = None,
                  model_version: Optional[str] = None,
                  max_seq_len_query: int = 64,
@@ -136,25 +138,39 @@ class DensePassageRetriever(BaseRetriever):
             tokenizers_default_classes["query"] = None   # type: ignore
             tokenizers_default_classes["passage"] = None # type: ignore
 
+        self.model_type = "default"
+        if isinstance(passage_embedding_model, nn.Module) and isinstance(
+                passage_embedding_model, nn.Module):
+            self.model_type = "self-written"
+
         # Init & Load Encoders
         if single_model_path is None:
-            self.query_tokenizer = Tokenizer.load(pretrained_model_name_or_path=query_embedding_model,
-                                                  revision=model_version,
-                                                  do_lower_case=True,
-                                                  use_fast=use_fast_tokenizers,
-                                                  tokenizer_class=tokenizers_default_classes["query"])
-            self.query_encoder = LanguageModel.load(pretrained_model_name_or_path=query_embedding_model,
-                                                    revision=model_version,
-                                                    language_model_class="DPRQuestionEncoder")
-            self.passage_tokenizer = Tokenizer.load(pretrained_model_name_or_path=passage_embedding_model,
-                                                    revision=model_version,
-                                                    do_lower_case=True,
-                                                    use_fast=use_fast_tokenizers,
-                                                    tokenizer_class=tokenizers_default_classes["passage"])
-            self.passage_encoder = LanguageModel.load(pretrained_model_name_or_path=passage_embedding_model,
+            if self.model_type == "default":
+                self.query_tokenizer = Tokenizer.load(pretrained_model_name_or_path=query_embedding_model,
                                                       revision=model_version,
-                                                      language_model_class="DPRContextEncoder")
-
+                                                      do_lower_case=True,
+                                                      use_fast=use_fast_tokenizers,
+                                                      tokenizer_class=tokenizers_default_classes["query"])
+                self.query_encoder = LanguageModel.load(pretrained_model_name_or_path=query_embedding_model,
+                                                        revision=model_version,
+                                                        language_model_class="DPRQuestionEncoder")
+                self.passage_tokenizer = Tokenizer.load(pretrained_model_name_or_path=passage_embedding_model,
+                                                        revision=model_version,
+                                                        do_lower_case=True,
+                                                        use_fast=use_fast_tokenizers,
+                                                        tokenizer_class=tokenizers_default_classes["passage"])
+                self.passage_encoder = LanguageModel.load(pretrained_model_name_or_path=passage_embedding_model,
+                                                          revision=model_version,
+                                                          language_model_class="DPRContextEncoder")
+            else:
+                self.query_tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=query_embedding_model
+                        .model_name)
+                self.query_encoder = query_embedding_model
+                self.passage_tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=passage_embedding_model
+                        .model_name)
+                self.passage_encoder = passage_embedding_model
             self.processor = TextSimilarityProcessor(query_tokenizer=self.query_tokenizer,
                                                      passage_tokenizer=self.passage_tokenizer,
                                                      max_seq_len_passage=max_seq_len_passage,
