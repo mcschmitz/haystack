@@ -469,15 +469,6 @@ class DensePassageRetriever(BaseRetriever):
 class EmbeddingRetriever(BaseRetriever):
 
     def __init__(
-<<<<<<< HEAD
-        self,
-        document_store: BaseDocumentStore,
-        embedding_model: Union[str, object],
-        use_gpu: bool = True,
-        model_format: str = "farm",
-        pooling_strategy: str = "reduce_mean",
-        emb_extraction_layer: int = -1,
-=======
             self,
             embedding_model: Union[str, object],
             document_store: BaseDocumentStore,
@@ -487,7 +478,6 @@ class EmbeddingRetriever(BaseRetriever):
             pooling_strategy: str = "reduce_mean",
             emb_extraction_layer: int = -1,
             top_k: int = 10,
->>>>>>> 7fbce612dd1e91c1234a8a86f1512c5b5ed12b59
     ):
         """
         :param document_store: An instance of DocumentStore from which to retrieve documents.
