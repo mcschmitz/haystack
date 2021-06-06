@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class PDFToTextConverter(BaseConverter):
-    def __init__(self, remove_numeric_tables: Optional[bool] = False, valid_languages: Optional[List[str]] = None):
+    def __init__(self, remove_numeric_tables: bool = False, valid_languages: Optional[List[str]] = None):
         """
         :param remove_numeric_tables: This option uses heuristics to remove numeric rows from the tables.
                                       The tabular structures in documents might be noise for the reader model if it
@@ -22,14 +22,18 @@ class PDFToTextConverter(BaseConverter):
                                 not one of the valid languages, then it might likely be encoding error resulting
                                 in garbled text.
         """
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(remove_numeric_tables=remove_numeric_tables, valid_languages=valid_languages)
+
         verify_installation = subprocess.run(["pdftotext -v"], shell=True)
         if verify_installation.returncode == 127:
             raise Exception(
                 """pdftotext is not installed. It is part of xpdf or poppler-utils software suite.
                 
                    Installation on Linux:
-                   wget --no-check-certificate https://dl.xpdfreader.com/xpdf-tools-linux-4.02.tar.gz &&
-                   tar -xvf xpdf-tools-linux-4.02.tar.gz && sudo cp xpdf-tools-linux-4.02/bin64/pdftotext /usr/local/bin
+                   wget --no-check-certificate https://dl.xpdfreader.com/xpdf-tools-linux-4.03.tar.gz &&
+                   tar -xvf xpdf-tools-linux-4.03.tar.gz && sudo cp xpdf-tools-linux-4.03/bin64/pdftotext /usr/local/bin
                    
                    Installation on MacOS:
                    brew install xpdf
@@ -40,14 +44,43 @@ class PDFToTextConverter(BaseConverter):
 
         super().__init__(remove_numeric_tables=remove_numeric_tables, valid_languages=valid_languages)
 
-    def convert(self, file_path: Path, meta: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    def convert(
+        self,
+        file_path: Path,
+        meta: Optional[Dict[str, str]] = None,
+        remove_numeric_tables: Optional[bool] = None,
+        valid_languages: Optional[List[str]] = None,
+        encoding: Optional[str] = "Latin1",
+    ) -> Dict[str, Any]:
         """
-        Extract text from a .pdf file.
+        Extract text from a .pdf file using the pdftotext library (https://www.xpdfreader.com/pdftotext-man.html)
 
         :param file_path: Path to the .pdf file you want to convert
+        :param meta: Optional dictionary with metadata that shall be attached to all resulting documents.
+                     Can be any custom keys and values.
+        :param remove_numeric_tables: This option uses heuristics to remove numeric rows from the tables.
+                                      The tabular structures in documents might be noise for the reader model if it
+                                      does not have table parsing capability for finding answers. However, tables
+                                      may also have long strings that could possible candidate for searching answers.
+                                      The rows containing strings are thus retained in this option.
+        :param valid_languages: validate languages from a list of languages specified in the ISO 639-1
+                                (https://en.wikipedia.org/wiki/ISO_639-1) format.
+                                This option can be used to add test for encoding errors. If the extracted text is
+                                not one of the valid languages, then it might likely be encoding error resulting
+                                in garbled text.
+        :param encoding: Encoding that will be passed as -enc parameter to pdftotext. "Latin 1" is the default encoding
+                         of pdftotext. While this works well on many PDFs, it might be needed to switch to "UTF-8" or
+                         others if your doc contains special characters (e.g. German Umlauts, Cyrillic characters ...).
+                         Note: With "UTF-8" we experienced cases, where a simple "fi" gets wrongly parsed as
+                         "xef\xac\x81c" (see test cases). That's why we keep "Latin 1" as default here.
+                         (See list of available encodings by running `pdftotext -listencodings` in the terminal)
         """
 
-        pages = self._read_pdf(file_path, layout=False)
+        pages = self._read_pdf(file_path, layout=False, encoding=encoding)
+        if remove_numeric_tables is None:
+            remove_numeric_tables = self.remove_numeric_tables
+        if valid_languages is None:
+            valid_languages = self.valid_languages
 
         cleaned_pages = []
         for page in pages:
@@ -68,7 +101,7 @@ class PDFToTextConverter(BaseConverter):
                 digits = [word for word in words if any(i.isdigit() for i in word)]
 
                 # remove lines having > 40% of words as digits AND not ending with a period(.)
-                if self.remove_numeric_tables:
+                if remove_numeric_tables:
                     if words and len(digits) / len(words) > 0.4 and not line.strip().endswith("."):
                         logger.debug(f"Removing line '{line}' from {file_path}")
                         continue
@@ -77,7 +110,7 @@ class PDFToTextConverter(BaseConverter):
             page = "\n".join(cleaned_lines)
             cleaned_pages.append(page)
 
-        if self.valid_languages:
+        if valid_languages:
             document_text = "".join(cleaned_pages)
             if not self.validate_language(document_text):
                 logger.warning(
@@ -89,7 +122,7 @@ class PDFToTextConverter(BaseConverter):
         document = {"text": text, "meta": meta}
         return document
 
-    def _read_pdf(self, file_path: Path, layout: bool) -> List[str]:
+    def _read_pdf(self, file_path: Path, layout: bool, encoding: Optional[str] = "Latin1") -> List[str]:
         """
         Extract pages from the pdf file at file_path.
 
@@ -98,10 +131,10 @@ class PDFToTextConverter(BaseConverter):
                        the content stream order.
         """
         if layout:
-            command = ["pdftotext", "-layout", str(file_path), "-"]
+            command = ["pdftotext", "-enc", encoding, "-layout", str(file_path), "-"]
         else:
-            command = ["pdftotext", str(file_path), "-"]
-        output = subprocess.run(command, stdout=subprocess.PIPE, shell=False)
+            command = ["pdftotext", "-enc", encoding, str(file_path), "-"]
+        output = subprocess.run(command, stdout=subprocess.PIPE, shell=False) # type: ignore
         document = output.stdout.decode(errors="ignore")
         pages = document.split("\f")
         pages = pages[:-1]  # the last page in the split is always empty.

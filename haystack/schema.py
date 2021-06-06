@@ -1,46 +1,65 @@
 from typing import Any, Optional, Dict, List
 from uuid import uuid4
 
+import mmh3
 import numpy as np
+from abc import abstractmethod
 
 
 class Document:
-    def __init__(self, text: str,
-                 id: Optional[str] = None,
-                 score: Optional[float] = None,
-                 probability: Optional[float] = None,
-                 question: Optional[str] = None,
-                 meta: Dict[str, Any] = None,
-                 embedding: Optional[np.array] = None):
+    def __init__(
+        self,
+        text: str,
+        id: Optional[str] = None,
+        score: Optional[float] = None,
+        probability: Optional[float] = None,
+        question: Optional[str] = None,
+        meta: Dict[str, Any] = None,
+        embedding: Optional[np.ndarray] = None,
+        id_hash_keys: Optional[List[str]] = None
+    ):
         """
-        Object used to represent documents / passages in a standardized way within Haystack.
-        For example, this is what the retriever will return from the DocumentStore,
-        regardless if it's ElasticsearchDocumentStore or InMemoryDocumentStore.
+        One of the core data classes in Haystack. It's used to represent documents / passages in a standardized way within Haystack.
+        Documents are stored in DocumentStores, are returned by Retrievers, are the input for Readers and are used in
+        many other places that manipulate or interact with document-level data.
 
-        Note that there can be multiple Documents originating from one file (e.g. PDF),
-        if you split the text into smaller passages. We'll have one Document per passage in this case.
+        Note: There can be multiple Documents originating from one file (e.g. PDF), if you split the text
+        into smaller passages. We'll have one Document per passage in this case.
 
-        :param id: ID used within the DocumentStore
+        Each document has a unique ID. This can be supplied by the user or generated automatically.
+        It's particularly helpful for handling of duplicates and referencing documents in other objects (e.g. Labels)
+
+        There's an easy option to convert from/to dicts via `from_dict()` and `to_dict`.
+
         :param text: Text of the document
+        :param id: Unique ID for the document. If not supplied by the user, we'll generate one automatically by
+                   creating a hash from the supplied text. This behaviour can be further adjusted by `id_hash_keys`.
         :param score: Retriever's query score for a retrieved document
         :param probability: a pseudo probability by scaling score in the range 0 to 1
-        :param question: Question text for FAQs.
+        :param question: Question text (e.g. for FAQs where one document usually consists of one question and one answer text).
         :param meta: Meta fields for a document like name, url, or author.
         :param embedding: Vector encoding of the text
+        :param id_hash_keys: Generate the document id from a custom list of strings.
+                             If you want ensure you don't have duplicate documents in your DocumentStore but texts are
+                             not unique, you can provide custom strings here that will be used (e.g. ["filename_xy", "text_of_doc"].
         """
 
         self.text = text
-        # Create a unique ID (either new one, or one from user input)
-        if id:
-            self.id = str(id)
-        else:
-            self.id = str(uuid4())
-
         self.score = score
         self.probability = probability
         self.question = question
         self.meta = meta or {}
         self.embedding = embedding
+
+        # Create a unique ID (either new one, or one from user input)
+        if id:
+            self.id = str(id)
+        else:
+            self.id = self._get_id(id_hash_keys)
+
+    def _get_id(self, id_hash_keys):
+        final_hash_key = ":".join(id_hash_keys) if id_hash_keys else self.text
+        return '{:02x}'.format(mmh3.hash128(final_hash_key, signed=False))
 
     def to_dict(self, field_map={}):
         inv_field_map = {v:k for k, v in field_map.items()}
@@ -77,16 +96,20 @@ class Document:
     def __str__(self):
         return str(self.to_dict())
 
+
 class Label:
     def __init__(self, question: str,
                  answer: str,
                  is_correct_answer: bool,
                  is_correct_document: bool,
                  origin: str,
+                 id: Optional[str] = None,
                  document_id: Optional[str] = None,
                  offset_start_in_doc: Optional[int] = None,
                  no_answer: Optional[bool] = None,
-                 model_id: Optional[int] = None):
+                 model_id: Optional[int] = None,
+                 created_at: Optional[str] = None,
+                 updated_at: Optional[str] = None):
         """
         Object used to represent label/feedback in a standardized way within Haystack.
         This includes labels from dataset like SQuAD, annotations from labeling tools,
@@ -99,11 +122,25 @@ class Label:
                                     incorrect answer but correct document & incorrect document. This flag denotes if
                                     the returned document was correct.
         :param origin: the source for the labels. It can be used to later for filtering.
+        :param id: Unique ID used within the DocumentStore. If not supplied, a uuid will be generated automatically.
         :param document_id: the document_store's ID for the returned answer document.
         :param offset_start_in_doc: the answer start offset in the document.
         :param no_answer: whether the question in unanswerable.
         :param model_id: model_id used for prediction (in-case of user feedback).
+        :param created_at: Timestamp of creation with format yyyy-MM-dd HH:mm:ss.
+                           Generate in Python via time.strftime("%Y-%m-%d %H:%M:%S").
+        :param created_at: Timestamp of update with format yyyy-MM-dd HH:mm:ss.
+                           Generate in Python via time.strftime("%Y-%m-%d %H:%M:%S")
         """
+
+        # Create a unique ID (either new one, or one from user input)
+        if id:
+            self.id = str(id)
+        else:
+            self.id = str(uuid4())
+
+        self.created_at = created_at
+        self.updated_at = updated_at
         self.question = question
         self.answer = answer
         self.is_correct_answer = is_correct_answer
@@ -132,7 +169,9 @@ class Label:
                 getattr(other, 'document_id', None) == self.document_id and
                 getattr(other, 'offset_start_in_doc', None) == self.offset_start_in_doc and
                 getattr(other, 'no_answer', None) == self.no_answer and
-                getattr(other, 'model_id', None) == self.model_id)
+                getattr(other, 'model_id', None) == self.model_id and
+                getattr(other, 'created_at', None) == self.created_at and
+                getattr(other, 'updated_at', None) == self.updated_at)
 
     def __hash__(self):
         return hash(self.question +
@@ -143,7 +182,8 @@ class Label:
                     str(self.document_id) +
                     str(self.offset_start_in_doc) +
                     str(self.no_answer) +
-                    str(self.model_id))
+                    str(self.model_id)
+                    )
 
     def __repr__(self):
         return str(self.to_dict())
@@ -198,3 +238,60 @@ class MultiLabel:
 
     def __str__(self):
         return str(self.to_dict())
+
+
+class BaseComponent:
+    """
+    A base class for implementing nodes in a Pipeline.
+    """
+
+    outgoing_edges: int
+    subclasses: dict = {}
+    pipeline_config: dict = {}
+
+    def __init_subclass__(cls, **kwargs):
+        """ This automatically keeps track of all available subclasses.
+        Enables generic load() for all specific component implementations.
+        """
+        super().__init_subclass__(**kwargs)
+        cls.subclasses[cls.__name__] = cls
+
+    @classmethod
+    def load_from_args(cls, component_type: str, **kwargs):
+        """
+        Load a component instance of the given type using the kwargs.
+        
+        :param component_type: name of the component class to load.
+        :param kwargs: parameters to pass to the __init__() for the component. 
+        """
+        if component_type not in cls.subclasses.keys():
+            raise Exception(f"Haystack component with the name '{component_type}' does not exist.")
+        instance = cls.subclasses[component_type](**kwargs)
+        return instance
+
+    @abstractmethod
+    def run(self, *args: Any, **kwargs: Any):
+        """
+        Method that will be executed when the node in the graph is called.
+        The argument that are passed can vary between different types of nodes
+        (e.g. retriever nodes expect different args than a reader node)
+        See an example for an implementation in haystack/reader/base/BaseReader.py
+        :param kwargs:
+        :return:
+        """
+        pass
+
+    def set_config(self, **kwargs):
+        """
+        Save the init parameters of a component that later can be used with exporting
+        YAML configuration of a Pipeline.
+
+        :param kwargs: all parameters passed to the __init__() of the Component.
+        """
+        if not self.pipeline_config:
+            self.pipeline_config = {"params": {}, "type": type(self).__name__}
+            for k, v in kwargs.items():
+                if isinstance(v, BaseComponent):
+                    self.pipeline_config["params"][k] = v.pipeline_config
+                elif v is not None:
+                    self.pipeline_config["params"][k] = v

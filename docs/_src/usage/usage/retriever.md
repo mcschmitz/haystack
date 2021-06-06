@@ -9,8 +9,8 @@ id: "retrievermd"
 
 # Retriever
 
-The Retriever is a lightweight filter that can quickly go through the full document store and pass a set of candidate documents to the Reader.
-It is an tool for sifting out the obvious negative cases, saving the Reader from doing more work than it needs to and speeding up the querying process.
+The Retriever is a lightweight filter that can quickly go through the full document store and pass on a set of candidate documents that are relevant to the query.
+When used in combination with a Reader, it is a tool for sifting out the obvious negative cases, saving the Reader from doing more work than it needs to and speeding up the querying process.
 
 <div class="recommendation">
 
@@ -27,12 +27,12 @@ It is an tool for sifting out the obvious negative cases, saving the Reader from
 Note that not all Retrievers can be paired with every DocumentStore.
 Here are the combinations which are supported:
 
-| | Memory | Elasticsearch | SQL | FAISS |
-| --- | --- | --- | ---- | ---- |
-| BM25 | N | Y | N | N |
-| TF-IDF | Y | Y | Y | N |
-| Embedding | Y | Y | N | Y |
-| DPR | Y | Y | N | Y |
+| | Memory | Elasticsearch | SQL | FAISS | Milvus |
+| --- | --- | --- | ---- | ---- | ---- |
+| BM25 | N | Y | N | N | N |
+| TF-IDF | Y | Y | Y | N | N |
+| Embedding | Y | Y | N | Y | Y |
+| DPR | Y | Y | N | Y | Y |
 
 See [Optimization](/docs/latest/optimizationmd) for suggestions on how to choose top-k values.
 
@@ -45,7 +45,6 @@ TF-IDF is a commonly used baseline for information retrieval that exploits two k
 
 
 * documents that have more lexical overlap with the query are more likely to be relevant
-
 
 * words that occur in fewer documents are more significant than words that occur in many documents
 
@@ -63,24 +62,21 @@ Where:
 
 * `idf` is the inverse of the fraction of documents containing the word.
 
-In practice, both terms are usually log normalised. If you’d like to learn more about the exact details of the algorithm,
-have a look at [this video](https://www.youtube.com/watch?v=hNXwhF0OZ_o).
+In practice, both terms are usually log normalised.
 
 ### Initialisation
 
 ```python
+from haystack.document_store import InMemoryDocumentStore
+from haystack.retriever.sparse import TfidfRetriever
+from haystack.pipeline import ExtractiveQAPipeline
+
 document_store = InMemoryDocumentStore()
 ...
 retriever = TfidfRetriever(document_store)
 ...
-finder = Finder(reader, retriever)
+p = ExtractiveQAPipeline(reader, retriever)
 ```
-
-<div class="recommendation">
-
-**Tip:** The Finder class is being deprecated and has been replaced by a more powerful [Pipelines class](/docs/latest/pipelinesmd).
-
-</div>
 
 ## BM25 (Recommended)
 
@@ -98,18 +94,16 @@ It improves upon its predecessor in two main aspects:
 ### Initialisation
 
 ```python
+from haystack.document_store import ElasticsearchDocumentStore
+from haystack.retriever import ElasticsearchRetriever
+from haystack.pipeline import ExtractiveQAPipeline
+
 document_store = ElasticsearchDocumentStore()
 ...
 retriever = ElasticsearchRetriever(document_store)
 ...
-finder = Finder(reader, retriever)
+p = ExtractiveQAPipeline(reader, retriever)
 ```
-
-<div class="recommendation">
-
-**Tip:** The Finder class is being deprecated and has been replaced by a more powerful [Pipelines class](/docs/latest/pipelinesmd).
-
-</div>
 
 See [this](https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables) blog post for more details about the algorithm.
 
@@ -125,7 +119,7 @@ Key features:
 * One BERT base model to encode documents
 
 
-* One Bert base model to encode queries
+* One BERT base model to encode queries
 
 
 * Ranking of documents done by dot product similarity between query and document embeddings
@@ -134,6 +128,19 @@ Key features:
 Indexing using DPR is comparatively expensive in terms of required computation since all documents in the database need to be processed through the transformer.
 The embeddings that are created in this step can be stored in FAISS, a database optimized for vector similarity.
 DPR can also work with the ElasticsearchDocumentStore or the InMemoryDocumentStore.
+
+There are two design decisions that have made DPR particularly performant.
+
+
+* Separate encoders for document and query helps since queries are much shorter than documents
+
+
+* Training with ‘In-batch negatives’ (gold labels are treated as negative examples for other samples in same batch) is highly efficient
+
+In Haystack, you can simply download the pretrained encoders needed to start using DPR.
+If you’d like to learn how to set up a DPR based system, have a look at the [tutorial](/docs/latest/tutorial6md)!
+
+### Initialisation
 
 <div class="recommendation">
 
@@ -145,20 +152,11 @@ as is done in the code example below.
 
 </div>
 
-There are two design decisions that have made DPR particularly performant.
-
-
-* Separate encoders for document and query helps since queries are much shorter than documents
-
-
-* Training with ‘In-batch negatives’ (gold labels are treated as negative examples for other samples in same batch) is highly efficient
-
-In Haystack, you can simply download the pretrained encoders needed to start using DPR.
-If you’d like to learn how to set up a DPR based system, have a look at our tutorials.
-
-### Initialisation
-
 ```python
+from haystack.document_store import FAISSDocumentStore
+from haystack.retriever import DensePassageRetriever
+from haystack.pipeline import ExtractiveQAPipeline
+
 document_store = FAISSDocumentStore(similarity="dot_product")
 ...
 retriever = DensePassageRetriever(
@@ -167,18 +165,12 @@ retriever = DensePassageRetriever(
     passage_embedding_model="facebook/dpr-ctx_encoder-single-nq-base"
 )
 ...
-finder = Finder(reader, retriever)
+finder = ExtractiveQAPipeline(reader, retriever)
 ```
 
 <div class="recommendation">
 
-**Tip:** The Finder class is being deprecated and has been replaced by a more powerful [Pipelines class](/docs/latest/pipelinesmd).
-
-</div>
-
-<div class="recommendation">
-
-**Tip:** Haystack supports training of your own DPR model! Tutorial coming soon!
+**Training DPR:** Haystack supports training of your own DPR model! Check out the [tutorial](/docs/latest/tutorial9md) to see how this is done!
 
 </div>
 
@@ -209,19 +201,17 @@ as is done in the code example below.
 ### Initialisation
 
 ```python
+from haystack.document_store import ElasticsearchDocumentStore
+from haystack.retriever import EmbeddingRetriever
+from haystack.pipeline import ExtractiveQAPipeline
+
 document_store = ElasticsearchDocumentStore(similarity="cosine")
 ...
 retriever = EmbeddingRetriever(document_store=document_store,
                                embedding_model="deepset/sentence_bert")
 ...
-finder = Finder(reader, retriever)
+p = ExtractiveQAPipeline(reader, retriever)
 ```
-
-<div class="recommendation">
-
-**Tip:** The Finder class is being deprecated and has been replaced by a more powerful [Pipelines class](/docs/latest/pipelinesmd).
-
-</div>
 
 ## Deeper Dive: Dense vs Sparse
 

@@ -16,13 +16,13 @@ logger = logging.getLogger(__name__)
 class PreProcessor(BasePreProcessor):
     def __init__(
         self,
-        clean_whitespace: Optional[bool] = True,
-        clean_header_footer: Optional[bool] = False,
-        clean_empty_lines: Optional[bool] = True,
-        split_by: Optional[str] = "word",
-        split_length: Optional[int] = 1000,
-        split_stride: Optional[int] = None,
-        split_respect_sentence_boundary: Optional[bool] = True,
+        clean_whitespace: bool = True,
+        clean_header_footer: bool = False,
+        clean_empty_lines: bool = True,
+        split_by: str = "word",
+        split_length: int = 1000,
+        split_overlap: int = 0,
+        split_respect_sentence_boundary: bool = True,
     ):
         """
         :param clean_header_footer: Use heuristic to remove footers and headers across different pages by searching
@@ -34,35 +34,99 @@ class PreProcessor(BasePreProcessor):
         :param split_by: Unit for splitting the document. Can be "word", "sentence", or "passage". Set to None to disable splitting.
         :param split_length: Max. number of the above split unit (e.g. words) that are allowed in one document. For instance, if n -> 10 & split_by ->
                            "sentence", then each output document will have 10 sentences.
-        :param split_stride: Length of striding window over the splits. For example, if split_by -> `word`,
-                             split_length -> 5 & split_stride -> 2, then the splits would be like:
-                             [w1 w2 w3 w4 w5, w4 w5 w6 w7 w8, w7 w8 w10 w11 w12].
-                             Set the value to None to disable striding behaviour.
+        :param split_overlap: Word overlap between two adjacent documents after a split.
+                              Setting this to a positive number essentially enables the sliding window approach.
+                              For example, if split_by -> `word`,
+                              split_length -> 5 & split_overlap -> 2, then the splits would be like:
+                              [w1 w2 w3 w4 w5, w4 w5 w6 w7 w8, w7 w8 w10 w11 w12].
+                              Set the value to 0 to ensure there is no overlap among the documents after splitting.
         :param split_respect_sentence_boundary: Whether to split in partial sentences if split_by -> `word`. If set
                                                 to True, the individual split will always have complete sentences &
                                                 the number of words will be <= split_length.
         """
-        nltk.download("punkt")
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(
+            clean_whitespace=clean_whitespace, clean_header_footer=clean_header_footer,
+            clean_empty_lines=clean_empty_lines, split_by=split_by, split_length=split_length,
+            split_overlap=split_overlap, split_respect_sentence_boundary=split_respect_sentence_boundary,
+        )
+
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            nltk.download('punkt')
+            
         self.clean_whitespace = clean_whitespace
         self.clean_header_footer = clean_header_footer
         self.clean_empty_lines = clean_empty_lines
         self.split_by = split_by
         self.split_length = split_length
-        self.split_stride = split_stride
+        self.split_overlap = split_overlap
         self.split_respect_sentence_boundary = split_respect_sentence_boundary
 
-    def clean(self, document: dict) -> dict:
+    def process(
+        self,
+        document: dict,
+        clean_whitespace: Optional[bool] = None,
+        clean_header_footer: Optional[bool] = None,
+        clean_empty_lines: Optional[bool] = None,
+        split_by: Optional[str] = None,
+        split_length: Optional[int] = None,
+        split_overlap: Optional[int] = None,
+        split_respect_sentence_boundary: Optional[bool] = None,
+    ) -> List[dict]:
+        """
+        Perform document cleaning and splitting. Takes a single document as input and returns a list of documents.
+        """
+        if clean_whitespace is None:
+            clean_whitespace = self.clean_whitespace
+        if clean_header_footer is None:
+            clean_header_footer = self.clean_header_footer
+        if clean_empty_lines is None:
+            clean_empty_lines = self.clean_empty_lines
+        if split_by is None:
+            split_by = self.split_by
+        if split_length is None:
+            split_length = self.split_length
+        if split_overlap is None:
+            split_overlap = self.split_overlap
+        if split_respect_sentence_boundary is None:
+            split_respect_sentence_boundary = self.split_respect_sentence_boundary
+
+        cleaned_document = self.clean(
+            document=document,
+            clean_whitespace=clean_whitespace,
+            clean_header_footer=clean_header_footer,
+            clean_empty_lines=clean_empty_lines,
+        )
+        split_documents = self.split(
+            document=cleaned_document,
+            split_by=split_by,
+            split_length=split_length,
+            split_overlap=split_overlap,
+            split_respect_sentence_boundary=split_respect_sentence_boundary,
+        )
+        return split_documents
+
+    def clean(
+        self,
+        document: dict,
+        clean_whitespace: bool,
+        clean_header_footer: bool,
+        clean_empty_lines: bool,
+    ) -> dict:
         """
         Perform document cleaning on a single document and return a single document. This method will deal with whitespaces, headers, footers
         and empty lines. Its exact functionality is defined by the parameters passed into PreProcessor.__init__().
         """
         text = document["text"]
-        if self.clean_header_footer:
+        if clean_header_footer:
             text = self._find_and_remove_header_footer(
                 text, n_chars=300, n_first_pages_to_ignore=1, n_last_pages_to_ignore=1
             )
 
-        if self.clean_whitespace:
+        if clean_whitespace:
             lines = text.splitlines()
 
             cleaned_lines = []
@@ -71,30 +135,44 @@ class PreProcessor(BasePreProcessor):
                 cleaned_lines.append(line)
             text = "\n".join(cleaned_lines)
 
-        if self.clean_empty_lines:
+        if clean_empty_lines:
             text = re.sub(r"\n\n+", "\n\n", text)
 
         document["text"] = text
         return document
 
-    def split(self, document: dict) -> List[dict]:
+    def split(
+        self,
+        document: dict,
+        split_by: str,
+        split_length: int,
+        split_overlap: int,
+        split_respect_sentence_boundary: bool,
+    ) -> List[dict]:
         """Perform document splitting on a single document. This method can split on different units, at different lengths,
-        with different strides. It can also respect sectence boundaries. Its exact functionality is defined by
+        with different strides. It can also respect sentence boundaries. Its exact functionality is defined by
         the parameters passed into PreProcessor.__init__(). Takes a single document as input and returns a list of documents. """
 
-        if not self.split_by:
+        if not split_by:
             return [document]
 
-        if not self.split_length:
+        if not split_length:
             raise Exception("split_length needs be set when using split_by.")
 
-        if self.split_respect_sentence_boundary and self.split_by not in("word","sentence"):
-            raise NotImplementedError("'split_respect_sentence_boundary=True' is only compatible with"
-                                      " split_by='word' or split_by='sentence'.")
+        if split_respect_sentence_boundary and split_by != "word":
+            raise NotImplementedError("'split_respect_sentence_boundary=True' is only compatible with split_by='word'.")
 
         text = document["text"]
 
-        if self.split_respect_sentence_boundary and self.split_by == "word":
+        if split_by == "word":
+            # Check if splitting by word causes cleaning of multiple whitespaces as a side effect
+            if len(document["text"]) != len(" ".join(document["text"].split())):
+                logger.warning(f"During PreProcessor.split(), white space normalization has occurred. This can cause "
+                               f"issues during evaluation if an answer span contains multiple whitespaces. "
+                               f"This problem may be solved by initializing the PreProcessor with split_by=\'passage\'"
+                               f"(Problematic doc_id: {document.get('id', None)}, beginning of doc: {document['text'][:100]})")
+
+        if split_respect_sentence_boundary and split_by == "word":
             # split by words ensuring no sub sentence splits
             sentences = nltk.tokenize.sent_tokenize(text)
             word_count = 0
@@ -102,17 +180,17 @@ class PreProcessor(BasePreProcessor):
             current_slice: List[str] = []
             for sen in sentences:
                 current_word_count = len(sen.split(" "))
-                if current_word_count > self.split_length:
+                if current_word_count > split_length:
                     logger.warning(f"A sentence found with word count higher than the split length.")
-                if word_count + current_word_count > self.split_length:
+                if word_count + current_word_count > split_length:
                     list_splits.append(current_slice)
-                    #Enable split_stride with split_by='word' while respecting sentence boundaries.
-                    if self.split_stride:
+                    # Enable split_stride with split_by='word' while respecting sentence boundaries.
+                    if split_overlap:
                         overlap = []
                         w_count = 0
                         for s in current_slice[::-1]:
                             sen_len = len(s.split(" "))
-                            if w_count < self.split_stride:
+                            if w_count < split_overlap:
                                 overlap.append(s)
                                 w_count += sen_len
                             else:
@@ -126,27 +204,33 @@ class PreProcessor(BasePreProcessor):
                 word_count += len(sen.split(" "))
             if current_slice:
                 list_splits.append(current_slice)
-            text_splits = [' '.join(sl) for sl in list_splits]
+
+            text_splits = []
+            for sl in list_splits:
+                txt = ' '.join(sl)
+                if len(txt) > 0:
+                    text_splits.append(txt)
         else:
             # create individual "elements" of passage, sentence, or word
-            if self.split_by == "passage":
+            if split_by == "passage":
                 elements = text.split("\n\n")
-            elif self.split_by == "sentence":
+            elif split_by == "sentence":
                 elements = nltk.tokenize.sent_tokenize(text)
-            elif self.split_by == "word":
+            elif split_by == "word":
                 elements = text.split(" ")
             else:
-                raise NotImplementedError("PreProcessor only supports 'passage' or 'sentence' split_by options.")
+                raise NotImplementedError("PreProcessor only supports 'passage', 'sentence' or 'word' split_by options.")
 
             # concatenate individual elements based on split_length & split_stride
-            if self.split_stride:
-                segments = windowed(elements, n=self.split_length, step=self.split_length - self.split_stride)
+            if split_overlap:
+                segments = windowed(elements, n=split_length, step=split_length - split_overlap)
             else:
-                segments = windowed(elements, n=self.split_length, step=self.split_length)
+                segments = windowed(elements, n=split_length, step=split_length)
             text_splits = []
             for seg in segments:
                 txt = " ".join([t for t in seg if t])
-                text_splits.append(txt)
+                if len(txt) > 0:
+                    text_splits.append(txt)
 
         # create new document dicts for each text split
         documents = []

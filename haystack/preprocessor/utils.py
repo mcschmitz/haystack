@@ -3,8 +3,9 @@ import logging
 import tarfile
 import tempfile
 import zipfile
+import gzip
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union, Generator
 import json
 
 from farm.data_handler.utils import http_get
@@ -15,75 +16,200 @@ from haystack.file_converter.pdf import PDFToTextConverter
 from haystack.file_converter.tika import TikaConverter
 from haystack import Document, Label
 from haystack.file_converter.txt import TextConverter
+from haystack.preprocessor.preprocessor import PreProcessor
 
 logger = logging.getLogger(__name__)
 
 
-def eval_data_from_file(filename: str, max_docs: Union[int, bool]=None) -> Tuple[List[Document], List[Label]]:
+
+def eval_data_from_json(filename: str, max_docs: Union[int, bool] = None, preprocessor: PreProcessor = None, open_domain: bool =False) -> Tuple[List[Document], List[Label]]:
     """
     Read Documents + Labels from a SQuAD-style file.
     Document and Labels can then be indexed to the DocumentStore and be used for evaluation.
 
     :param filename: Path to file in SQuAD format
-    :param max_docs: This sets the number of documents that will be loaded. By default, this is set to None, thus reading in all available eval documents. 
+    :param max_docs: This sets the number of documents that will be loaded. By default, this is set to None, thus reading in all available eval documents.
+    :param open_domain: Set this to True if your file is an open domain dataset where two different answers to the same question might be found in different contexts.
     :return: (List of Documents, List of Labels)
     """
 
     docs: List[Document] = []
     labels = []
+    problematic_ids = []
 
-    with open(filename, "r") as file:
+    with open(filename, "r", encoding='utf-8') as file:
         data = json.load(file)
         if "title" not in data["data"][0]:
             logger.warning(f"No title information found for documents in QA file: {filename}")
+
         for document in data["data"]:
             if max_docs:
                 if len(docs) > max_docs:
                     break
-            # get all extra fields from document level (e.g. title)
-            meta_doc = {k: v for k, v in document.items() if k not in ("paragraphs", "title")}
-            for paragraph in document["paragraphs"]:
-                if max_docs:
-                    if len(docs) > max_docs:
-                        break
-                cur_meta = {"name": document.get("title", None)}
-                # all other fields from paragraph level
-                meta_paragraph = {k: v for k, v in paragraph.items() if k not in ("qas", "context")}
-                cur_meta.update(meta_paragraph)
-                # meta from parent document
-                cur_meta.update(meta_doc)
-                # Create Document
-                cur_doc = Document(text=paragraph["context"], meta=cur_meta)
-                docs.append(cur_doc)
+            # Extracting paragraphs and their labels from a SQuAD document dict
+            cur_docs, cur_labels, cur_problematic_ids = _extract_docs_and_labels_from_dict(
+                document,
+                preprocessor
+            )
+            docs.extend(cur_docs)
+            labels.extend(cur_labels)
+            problematic_ids.extend(cur_problematic_ids)
+    if len(problematic_ids) > 0:
+        logger.warning(f"Could not convert an answer for {len(problematic_ids)} questions.\n"
+                       f"There were conversion errors for question ids: {problematic_ids}")
+    return docs, labels
 
-                # Get Labels
-                for qa in paragraph["qas"]:
-                    if len(qa["answers"]) > 0:
-                        for answer in qa["answers"]:
-                            label = Label(
-                                question=qa["question"],
-                                answer=answer["text"],
-                                is_correct_answer=True,
-                                is_correct_document=True,
-                                document_id=cur_doc.id,
-                                offset_start_in_doc=answer["answer_start"],
-                                no_answer=qa["is_impossible"],
-                                origin="gold_label",
-                            )
-                            labels.append(label)
+
+def eval_data_from_jsonl(filename: str, batch_size: Optional[int] = None,
+                         max_docs: Union[int, bool] = None, preprocessor: PreProcessor = None,
+                         open_domain: bool = False) -> Generator[Tuple[List[Document], List[Label]], None, None]:
+    """
+    Read Documents + Labels from a SQuAD-style file in jsonl format, i.e. one document per line.
+    Document and Labels can then be indexed to the DocumentStore and be used for evaluation.
+
+    This is a generator which will yield one tuple per iteration containing a list
+    of batch_size documents and a list with the documents' labels.
+    If batch_size is set to None, this method will yield all documents and labels.
+
+    :param filename: Path to file in SQuAD format
+    :param max_docs: This sets the number of documents that will be loaded. By default, this is set to None, thus reading in all available eval documents.
+    :param open_domain: Set this to True if your file is an open domain dataset where two different answers to the same question might be found in different contexts.
+    :return: (List of Documents, List of Labels)
+    """
+
+    docs: List[Document] = []
+    labels = []
+    problematic_ids = []
+
+    with open(filename, "r", encoding='utf-8') as file:
+        for document in file:
+            if max_docs:
+                if len(docs) > max_docs:
+                    break
+            # Extracting paragraphs and their labels from a SQuAD document dict
+            document_dict = json.loads(document)
+            cur_docs, cur_labels, cur_problematic_ids = _extract_docs_and_labels_from_dict(document_dict, preprocessor, open_domain)
+            docs.extend(cur_docs)
+            labels.extend(cur_labels)
+            problematic_ids.extend(cur_problematic_ids)
+
+            if batch_size is not None:
+                if len(docs) >= batch_size:
+                    if len(problematic_ids) > 0:
+                        logger.warning(f"Could not convert an answer for {len(problematic_ids)} questions.\n"
+                                       f"There were conversion errors for question ids: {problematic_ids}")
+                    yield docs, labels
+                    docs = []
+                    labels = []
+                    problematic_ids = []
+
+    yield docs, labels
+
+
+def _extract_docs_and_labels_from_dict(document_dict: Dict, preprocessor: PreProcessor = None, open_domain: bool=False):
+    """Set open_domain to True if you are trying to load open_domain labels (i.e. labels without doc id or start idx)"""
+    docs = []
+    labels = []
+    problematic_ids = []
+
+    # get all extra fields from document level (e.g. title)
+    meta_doc = {k: v for k, v in document_dict.items() if k not in ("paragraphs", "title")}
+    for paragraph in document_dict["paragraphs"]:
+        ## Create Metadata
+        cur_meta = {"name": document_dict.get("title", None)}
+        # all other fields from paragraph level
+        meta_paragraph = {k: v for k, v in paragraph.items() if k not in ("qas", "context")}
+        cur_meta.update(meta_paragraph)
+        # meta from parent document
+        cur_meta.update(meta_doc)
+
+        ## Create Document
+        cur_doc = Document(text=paragraph["context"], meta=cur_meta)
+        if preprocessor is not None:
+            splits_dicts = preprocessor.process(cur_doc.to_dict())
+            # we need to pull in _split_id into the document id for unique reference in labels
+            # todo: PreProcessor should work on Documents instead of dicts
+            splits: List[Document] = []
+            offset = 0
+            for d in splits_dicts:
+                id = f"{d['id']}-{d['meta']['_split_id']}"
+                d["meta"]["_split_offset"] = offset
+                offset += len(d["text"])
+                # offset correction based on splitting method
+                if preprocessor.split_by == "word":
+                    offset += 1
+                elif preprocessor.split_by == "passage":
+                    offset += 2
+                else:
+                    raise NotImplementedError
+                mydoc = Document(text=d["text"],
+                                 id=id,
+                                 meta=d["meta"])
+                splits.append(mydoc)
+        else:
+            splits = [cur_doc]
+        docs.extend(splits)
+
+        ## Assign Labels to corresponding documents
+        for qa in paragraph["qas"]:
+            if not qa.get("is_impossible", False):
+                for answer in qa["answers"]:
+                    ans = answer["text"]
+                    cur_ans_start = None
+                    # TODO The following block of code means that answer_start is never calculated
+                    #  and cur_id is always None for open_domain
+                    #  This can be rewritten so that this function could try to calculate offsets
+                    #  and populate id in open_domain mode
+                    if open_domain:
+                        cur_ans_start = answer.get("answer_start", 0)
+                        cur_id = '0'
                     else:
-                        label = Label(
-                            question=qa["question"],
-                            answer="",
-                            is_correct_answer=True,
-                            is_correct_document=True,
-                            document_id=cur_doc.id,
-                            offset_start_in_doc=0,
-                            no_answer=qa["is_impossible"],
-                            origin="gold_label",
-                        )
-                        labels.append(label)
-        return docs, labels
+                        ans_position = cur_doc.text[answer["answer_start"]:answer["answer_start"]+len(ans)]
+                        if ans != ans_position:
+                            # do not use answer
+                            problematic_ids.append(qa.get("id","missing"))
+                            break
+                        # find corresponding document or split
+                        if len(splits) == 1:
+                            cur_id = splits[0].id
+                            cur_ans_start = answer["answer_start"]
+                        else:
+                            for s in splits:
+                                # If answer start offset is contained in passage we assign the label to that passage
+                                if (answer["answer_start"] >= s.meta["_split_offset"]) and (answer["answer_start"] < (s.meta["_split_offset"] + len(s.text))):
+                                    cur_id = s.id
+                                    cur_ans_start = answer["answer_start"] - s.meta["_split_offset"]
+                                    # If a document is splitting an answer we add the whole answer text to the document
+                                    if s.text[cur_ans_start:cur_ans_start+len(ans)] != ans:
+                                        s.text = s.text[:cur_ans_start] + ans
+                                    break
+                    label = Label(
+                        question=qa["question"],
+                        answer=ans,
+                        is_correct_answer=True,
+                        is_correct_document=True,
+                        document_id=cur_id,
+                        offset_start_in_doc=cur_ans_start,
+                        no_answer=qa.get("is_impossible", False),
+                        origin="gold_label",
+                    )
+                    labels.append(label)
+            else:
+                # for no_answer we need to assign each split as not fitting to the question
+                for s in splits:
+                    label = Label(
+                        question=qa["question"],
+                        answer="",
+                        is_correct_answer=True,
+                        is_correct_document=True,
+                        document_id=s.id,
+                        offset_start_in_doc=0,
+                        no_answer=qa.get("is_impossible", False),
+                        origin="gold_label",
+                    )
+                    labels.append(label)
+
+    return docs, labels, problematic_ids
 
 
 def convert_files_to_dicts(dir_path: str, clean_func: Optional[Callable] = None, split_paragraphs: bool = False) -> \
@@ -265,8 +391,32 @@ def fetch_archive_from_http(url: str, output_dir: str, proxies: Optional[dict] =
             elif url[-7:] == ".tar.gz":
                 tar_archive = tarfile.open(temp_file.name)
                 tar_archive.extractall(output_dir)
+            elif url[-3:] == ".gz":
+                filename = url.split("/")[-1].replace(".gz", "")
+                output_filename = Path(output_dir) / filename
+                with gzip.open(temp_file.name) as f, open(output_filename, "wb") as output:
+                        for line in f:
+                               output.write(line)
             else:
                 logger.warning('Skipped url {0} as file type is not supported here. '
                                'See haystack documentation for support of more file types'.format(url))
             # temp_file gets deleted here
         return True
+
+
+def squad_json_to_jsonl(squad_file: str, output_file: str):
+    """
+    Converts a SQuAD-json-file into jsonl format with one document per line.
+
+    :param squad_file: SQuAD-file in json format.
+    :type squad_file: str
+    :param output_file: Name of output file (SQuAD in jsonl format)
+    :type output_file: str
+    """
+    with open(squad_file, encoding='utf-8') as json_file, open(output_file, "w", encoding='utf-8') as jsonl_file:
+        squad_json = json.load(json_file)
+
+        for doc in squad_json["data"]:
+            json.dump(doc, jsonl_file)
+            jsonl_file.write("\n")
+

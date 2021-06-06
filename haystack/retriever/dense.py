@@ -1,15 +1,14 @@
 import logging
-from typing import List, Union, Tuple, Optional
+from typing import List, Union, Optional
 import torch
 import numpy as np
 from pathlib import Path
-from tqdm import tqdm
-
+from tqdm.auto import tqdm
+from torch import nn
 from haystack.document_store.base import BaseDocumentStore
-from haystack.document_store.elasticsearch import ElasticsearchDocumentStore
 from haystack import Document
 from haystack.retriever.base import BaseRetriever
-
+from transformers import AutoTokenizer
 from farm.infer import Inferencer
 from farm.modeling.tokenization import Tokenizer
 from farm.modeling.language_model import LanguageModel
@@ -36,15 +35,22 @@ class DensePassageRetriever(BaseRetriever):
 
     def __init__(self,
                  document_store: BaseDocumentStore,
-                 query_embedding_model: Union[Path, str] = "facebook/dpr-question_encoder-single-nq-base",
-                 passage_embedding_model: Union[Path, str] = "facebook/dpr-ctx_encoder-single-nq-base",
+                 query_embedding_model: Union[Path, str, object
+                 ] = "facebook/dpr-question_encoder-single-nq-base",
+                 passage_embedding_model: Union[Path, str, object] =
+                 "facebook/dpr-ctx_encoder-single-nq-base",
+                 single_model_path: Optional[Union[Path, str]] = None,
+                 model_version: Optional[str] = None,
                  max_seq_len_query: int = 64,
                  max_seq_len_passage: int = 256,
+                 top_k: int = 10,
                  use_gpu: bool = True,
                  batch_size: int = 16,
                  embed_title: bool = True,
                  use_fast_tokenizers: bool = True,
-                 similarity_function: str = "dot_product"
+                 infer_tokenizer_classes: bool = False,
+                 similarity_function: str = "dot_product",
+                 progress_bar: bool = True
                  ):
         """
         Init the Retriever incl. the two encoder models from a local or remote model checkpoint.
@@ -70,8 +76,13 @@ class DensePassageRetriever(BaseRetriever):
         :param passage_embedding_model: Local path or remote name of passage encoder checkpoint. The format equals the
                                         one used by hugging-face transformers' modelhub models
                                         Currently available remote names: ``"facebook/dpr-ctx_encoder-single-nq-base"``
+        :param single_model_path: Local path or remote name of a query and passage embedder in one single model. Those
+                                  models are typically trained within FARM.
+                                  Currently available remote names: TODO add FARM DPR model to HF modelhub
+        :param model_version: The version of model to use from the HuggingFace model hub. Can be tag name, branch name, or commit hash.
         :param max_seq_len_query: Longest length of each query sequence. Maximum number of tokens for the query text. Longer ones will be cut down."
         :param max_seq_len_passage: Longest length of each passage/context sequence. Maximum number of tokens for the passage text. Longer ones will be cut down."
+        :param top_k: How many documents to return per query.
         :param use_gpu: Whether to use gpu or not
         :param batch_size: Number of questions or passages to encode at once
         :param embed_title: Whether to concatenate title and passage to a text pair that is then used to create the embedding.
@@ -80,14 +91,35 @@ class DensePassageRetriever(BaseRetriever):
                             The title is expected to be present in doc.meta["name"] and can be supplied in the documents
                             before writing them to the DocumentStore like this:
                             {"text": "my text", "meta": {"name": "my title"}}.
+        :param use_fast_tokenizers: Whether to use fast Rust tokenizers
+        :param infer_tokenizer_classes: Whether to infer tokenizer class from the model config / name. 
+                                        If `False`, the class always loads `DPRQuestionEncoderTokenizer` and `DPRContextEncoderTokenizer`. 
+        :param similarity_function: Which function to apply for calculating the similarity of query and passage embeddings during training. 
+                                    Options: `dot_product` (Default) or `cosine`
+        :param progress_bar: Whether to show a tqdm progress bar or not.
+                             Can be helpful to disable in production deployments to keep the logs clean.
         """
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(
+            document_store=document_store, query_embedding_model=query_embedding_model,
+            passage_embedding_model=passage_embedding_model, single_model_path=single_model_path,
+            model_version=model_version, max_seq_len_query=max_seq_len_query, max_seq_len_passage=max_seq_len_passage,
+            top_k=top_k, use_gpu=use_gpu, batch_size=batch_size, embed_title=embed_title,
+            use_fast_tokenizers=use_fast_tokenizers, infer_tokenizer_classes=infer_tokenizer_classes,
+            similarity_function=similarity_function, progress_bar=progress_bar,
+        )
 
         self.document_store = document_store
         self.batch_size = batch_size
-        self.max_seq_len_passage = max_seq_len_passage
-        self.max_seq_len_query = max_seq_len_query
+        self.progress_bar = progress_bar
+        self.top_k = top_k
 
-        if document_store.similarity != "dot_product":
+        if document_store is None:
+           logger.warning("DensePassageRetriever initialized without a document store. "
+                          "This is fine if you are performing DPR training. "
+                          "Otherwise, please provide a document store in the constructor.")
+        elif document_store.similarity != "dot_product":
             logger.warning(f"You are using a Dense Passage Retriever model with the {document_store.similarity} function. "
                            "We recommend you use dot_product instead. "
                            "This can be set when initializing the DocumentStore")
@@ -97,42 +129,79 @@ class DensePassageRetriever(BaseRetriever):
         else:
             self.device = torch.device("cpu")
 
-        self.embed_title = embed_title
+        self.infer_tokenizer_classes = infer_tokenizer_classes
+        tokenizers_default_classes = {
+            "query": "DPRQuestionEncoderTokenizer",
+            "passage": "DPRContextEncoderTokenizer"
+        }
+        if self.infer_tokenizer_classes:
+            tokenizers_default_classes["query"] = None   # type: ignore
+            tokenizers_default_classes["passage"] = None # type: ignore
+
+        self.model_type = "default"
+        if isinstance(passage_embedding_model, nn.Module) and isinstance(
+                passage_embedding_model, nn.Module):
+            self.model_type = "self-written"
 
         # Init & Load Encoders
-        self.query_tokenizer = Tokenizer.load(pretrained_model_name_or_path=query_embedding_model,
-                                              do_lower_case=True, use_fast=use_fast_tokenizers)
-        self.query_encoder = LanguageModel.load(pretrained_model_name_or_path=query_embedding_model,
-                                                language_model_class="DPRQuestionEncoder")
+        if single_model_path is None:
+            if self.model_type == "default":
+                self.query_tokenizer = Tokenizer.load(pretrained_model_name_or_path=query_embedding_model,
+                                                      revision=model_version,
+                                                      do_lower_case=True,
+                                                      use_fast=use_fast_tokenizers,
+                                                      tokenizer_class=tokenizers_default_classes["query"])
+                self.query_encoder = LanguageModel.load(pretrained_model_name_or_path=query_embedding_model,
+                                                        revision=model_version,
+                                                        language_model_class="DPRQuestionEncoder")
+                self.passage_tokenizer = Tokenizer.load(pretrained_model_name_or_path=passage_embedding_model,
+                                                        revision=model_version,
+                                                        do_lower_case=True,
+                                                        use_fast=use_fast_tokenizers,
+                                                        tokenizer_class=tokenizers_default_classes["passage"])
+                self.passage_encoder = LanguageModel.load(pretrained_model_name_or_path=passage_embedding_model,
+                                                          revision=model_version,
+                                                          language_model_class="DPRContextEncoder")
+            else:
+                self.query_tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=query_embedding_model
+                        .model_name)
+                self.query_encoder = query_embedding_model
+                self.passage_tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=passage_embedding_model
+                        .model_name)
+                self.passage_encoder = passage_embedding_model
+            self.processor = TextSimilarityProcessor(query_tokenizer=self.query_tokenizer,
+                                                     passage_tokenizer=self.passage_tokenizer,
+                                                     max_seq_len_passage=max_seq_len_passage,
+                                                     max_seq_len_query=max_seq_len_query,
+                                                     label_list=["hard_negative", "positive"],
+                                                     metric="text_similarity_metric",
+                                                     embed_title=embed_title,
+                                                     num_hard_negatives=0,
+                                                     num_positives=1)
+            prediction_head = TextSimilarityHead(similarity_function=similarity_function)
+            self.model = BiAdaptiveModel(
+                language_model1=self.query_encoder,
+                language_model2=self.passage_encoder,
+                prediction_heads=[prediction_head],
+                embeds_dropout_prob=0.1,
+                lm1_output_types=["per_sequence"],
+                lm2_output_types=["per_sequence"],
+                device=self.device,
+            )
+        else:
+            self.processor = TextSimilarityProcessor.load_from_dir(single_model_path)
+            self.processor.max_seq_len_passage = max_seq_len_passage
+            self.processor.max_seq_len_query = max_seq_len_query
+            self.processor.embed_title = embed_title
+            self.processor.num_hard_negatives = 0
+            self.processor.num_positives = 1  # during indexing of documents only one embedding is created
+            self.model = BiAdaptiveModel.load(single_model_path, device=self.device)
 
-        self.passage_tokenizer = Tokenizer.load(pretrained_model_name_or_path=passage_embedding_model,
-                                                do_lower_case=True, use_fast=use_fast_tokenizers)
-        self.passage_encoder = LanguageModel.load(pretrained_model_name_or_path=passage_embedding_model,
-                                                  language_model_class="DPRContextEncoder")
-
-        self.processor = TextSimilarityProcessor(tokenizer=self.query_tokenizer,
-                                                 passage_tokenizer=self.passage_tokenizer,
-                                                 max_seq_len_passage=self.max_seq_len_passage,
-                                                 max_seq_len_query=self.max_seq_len_query,
-                                                 label_list=["hard_negative", "positive"],
-                                                 metric="text_similarity_metric",
-                                                 embed_title=self.embed_title,
-                                                 num_hard_negatives=0,
-                                                 num_positives=1)
-
-        prediction_head = TextSimilarityHead(similarity_function=similarity_function)
-        self.model = BiAdaptiveModel(
-            language_model1=self.query_encoder,
-            language_model2=self.passage_encoder,
-            prediction_heads=[prediction_head],
-            embeds_dropout_prob=0.1,
-            lm1_output_types=["per_sequence"],
-            lm2_output_types=["per_sequence"],
-            device=self.device,
-        )
         self.model.connect_heads_with_processor(self.processor.tasks, require_labels=False)
 
-    def retrieve(self, query: str, filters: dict = None, top_k: int = 10, index: str = None) -> List[Document]:
+    def retrieve(self, query: str, filters: dict = None, top_k: Optional[int] = None, index: str = None) -> List[Document]:
         """
         Scan through documents in DocumentStore and return a small number documents
         that are most relevant to the query.
@@ -142,6 +211,11 @@ class DensePassageRetriever(BaseRetriever):
         :param top_k: How many documents to return per query.
         :param index: The name of the index in the DocumentStore from which to retrieve documents
         """
+        if top_k is None:
+            top_k = self.top_k
+        if not self.document_store:
+            logger.error("Cannot perform retrieve() since DensePassageRetriever initialized with document_store=None")
+            return []
         if index is None:
             index = self.document_store.index
         query_emb = self.embed_queries(texts=[query])
@@ -166,8 +240,7 @@ class DensePassageRetriever(BaseRetriever):
         :return: dictionary of embeddings for "passages" and "query"
         """
 
-
-        dataset, tensor_names, baskets = self.processor.dataset_from_dicts(
+        dataset, tensor_names, _, baskets = self.processor.dataset_from_dicts(
             dicts, indices=[i for i in range(len(dicts))], return_baskets=True
         )
 
@@ -176,16 +249,26 @@ class DensePassageRetriever(BaseRetriever):
         )
         all_embeddings = {"query": [], "passages": []}
         self.model.eval()
-        for i, batch in enumerate(tqdm(data_loader, desc=f"Creating Embeddings", unit=" Batches", disable=False)):
-            batch = {key: batch[key].to(self.device) for key in batch}
 
-            # get logits
-            with torch.no_grad():
-                query_embeddings, passage_embeddings = self.model.forward(**batch)[0]
-                if query_embeddings is not None:
-                    all_embeddings["query"].append(query_embeddings.cpu().numpy())
-                if passage_embeddings is not None:
-                    all_embeddings["passages"].append(passage_embeddings.cpu().numpy())
+        # When running evaluations etc., we don't want a progress bar for every single query
+        if len(dataset) == 1:
+            disable_tqdm=True
+        else:
+            disable_tqdm = not self.progress_bar
+
+        with tqdm(total=len(data_loader)*self.batch_size, unit=" Docs", desc=f"Create embeddings", position=1,
+                  leave=False, disable=disable_tqdm) as progress_bar:
+            for batch in data_loader:
+                batch = {key: batch[key].to(self.device) for key in batch}
+
+                # get logits
+                with torch.no_grad():
+                    query_embeddings, passage_embeddings = self.model.forward(**batch)[0]
+                    if query_embeddings is not None:
+                        all_embeddings["query"].append(query_embeddings.cpu().numpy())
+                    if passage_embeddings is not None:
+                        all_embeddings["passages"].append(passage_embeddings.cpu().numpy())
+                progress_bar.update(self.batch_size)
 
         if all_embeddings["passages"]:
             all_embeddings["passages"] = np.concatenate(all_embeddings["passages"])
@@ -193,7 +276,7 @@ class DensePassageRetriever(BaseRetriever):
             all_embeddings["query"] = np.concatenate(all_embeddings["query"])
         return all_embeddings
 
-    def embed_queries(self, texts: List[str]) -> List[np.array]:
+    def embed_queries(self, texts: List[str]) -> List[np.ndarray]:
         """
         Create embeddings for a list of queries using the query encoder
 
@@ -204,7 +287,7 @@ class DensePassageRetriever(BaseRetriever):
         result = self._get_predictions(queries)["query"]
         return result
 
-    def embed_passages(self, docs: List[Document]) -> List[np.array]:
+    def embed_passages(self, docs: List[Document]) -> List[np.ndarray]:
         """
         Create embeddings for a list of passages using the passage encoder
 
@@ -226,6 +309,9 @@ class DensePassageRetriever(BaseRetriever):
               train_filename: str,
               dev_filename: str = None,
               test_filename: str = None,
+              max_sample: int = None,
+              max_processes: int = 128,
+              dev_split: float = 0,
               batch_size: int = 2,
               embed_title: bool = True,
               num_hard_negatives: int = 1,
@@ -238,6 +324,7 @@ class DensePassageRetriever(BaseRetriever):
               weight_decay: float = 0.0,
               num_warmup_steps: int = 100,
               grad_acc_steps: int = 1,
+              use_amp: str = None,
               optimizer_name: str = "TransformersAdamW",
               optimizer_correct_bias: bool = True,
               save_dir: str = "../saved_models/dpr",
@@ -250,6 +337,10 @@ class DensePassageRetriever(BaseRetriever):
         :param train_filename: training filename
         :param dev_filename: development set filename, file to be used by model in eval step of training
         :param test_filename: test set filename, file to be used by model in test step after training
+        :param max_sample: maximum number of input samples to convert. Can be used for debugging a smaller dataset.
+        :param max_processes: the maximum number of processes to spawn in the multiprocessing.Pool used in DataSilo.
+                              It can be set to 1 to disable the use of multiprocessing or make debugging easier.
+        :param dev_split: The proportion of the train set that will sliced. Only works if dev_filename is set to None
         :param batch_size: total number of samples in 1 batch of data
         :param embed_title: whether to concatenate passage title with each passage. The default setting in official DPR embeds passage title with the corresponding passage
         :param num_hard_negatives: number of hard negative passages(passages which are very similar(high score by BM25) to query but do not contain the answer
@@ -261,6 +352,12 @@ class DensePassageRetriever(BaseRetriever):
         :param epsilon: epsilon parameter of optimizer
         :param weight_decay: weight decay parameter of optimizer
         :param grad_acc_steps: number of steps to accumulate gradient over before back-propagation is done
+        :param use_amp: Whether to use automatic mixed precision (AMP) or not. The options are:
+                    "O0" (FP32)
+                    "O1" (Mixed Precision)
+                    "O2" (Almost FP16)
+                    "O3" (Pure FP16).
+                    For more information, refer to: https://nvidia.github.io/apex/amp.html
         :param optimizer_name: what optimizer to use (default: TransformersAdamW)
         :param num_warmup_steps: number of warmup steps
         :param optimizer_correct_bias: Whether to correct bias in optimizer
@@ -269,24 +366,19 @@ class DensePassageRetriever(BaseRetriever):
         :param passage_encoder_save_dir: directory inside save_dir where passage_encoder model files are saved
         """
 
-        self.embed_title = embed_title
-        self.processor = TextSimilarityProcessor(tokenizer=self.query_tokenizer,
-                                                 passage_tokenizer=self.passage_tokenizer,
-                                                 max_seq_len_passage=self.max_seq_len_passage,
-                                                 max_seq_len_query=self.max_seq_len_query,
-                                                 label_list=["hard_negative", "positive"],
-                                                 metric="text_similarity_metric",
-                                                 data_dir=data_dir,
-                                                 train_filename=train_filename,
-                                                 dev_filename=dev_filename,
-                                                 test_filename=test_filename,
-                                                 embed_title=self.embed_title,
-                                                 num_hard_negatives=num_hard_negatives,
-                                                 num_positives=num_positives)
+        self.processor.embed_title = embed_title
+        self.processor.data_dir = Path(data_dir)
+        self.processor.train_filename = train_filename
+        self.processor.dev_filename = dev_filename
+        self.processor.test_filename = test_filename
+        self.processor.max_sample = max_sample
+        self.processor.dev_split = dev_split
+        self.processor.num_hard_negatives = num_hard_negatives
+        self.processor.num_positives = num_positives
 
         self.model.connect_heads_with_processor(self.processor.tasks, require_labels=True)
 
-        data_silo = DataSilo(processor=self.processor, batch_size=batch_size, distributed=False)
+        data_silo = DataSilo(processor=self.processor, batch_size=batch_size, distributed=False, max_processes=max_processes)
 
         # 5. Create an optimizer
         self.model, optimizer, lr_schedule = initialize_optimizer(
@@ -298,7 +390,8 @@ class DensePassageRetriever(BaseRetriever):
             n_batches=len(data_silo.loaders["train"]),
             n_epochs=n_epochs,
             grad_acc_steps=grad_acc_steps,
-            device=self.device
+            device=self.device,
+            use_amp=use_amp
         )
 
         # 6. Feed everything to the Trainer, which keeps care of growing our model and evaluates it from time to time
@@ -311,6 +404,7 @@ class DensePassageRetriever(BaseRetriever):
             lr_schedule=lr_schedule,
             evaluate_every=evaluate_every,
             device=self.device,
+            use_amp=use_amp
         )
 
         # 7. Let it grow! Watch the tracked metrics live on the public mlflow server: https://public-mlflow.deepset.ai
@@ -367,12 +461,15 @@ class DensePassageRetriever(BaseRetriever):
             use_fast_tokenizers=use_fast_tokenizers,
             similarity_function=similarity_function
         )
+        logger.info(f"DPR model loaded from {load_dir}")
 
         return dpr
 
 
 class EmbeddingRetriever(BaseRetriever):
+
     def __init__(
+<<<<<<< HEAD
         self,
         document_store: BaseDocumentStore,
         embedding_model: Union[str, object],
@@ -380,10 +477,22 @@ class EmbeddingRetriever(BaseRetriever):
         model_format: str = "farm",
         pooling_strategy: str = "reduce_mean",
         emb_extraction_layer: int = -1,
+=======
+            self,
+            embedding_model: Union[str, object],
+            document_store: BaseDocumentStore,
+            model_version: Optional[str] = None,
+            use_gpu: bool = True,
+            model_format: str = "farm",
+            pooling_strategy: str = "reduce_mean",
+            emb_extraction_layer: int = -1,
+            top_k: int = 10,
+>>>>>>> 7fbce612dd1e91c1234a8a86f1512c5b5ed12b59
     ):
         """
         :param document_store: An instance of DocumentStore from which to retrieve documents.
         :param embedding_model: Local path or name of model in Hugging Face's model hub such as ``'deepset/sentence_bert'``
+        :param model_version: The version of model to use from the HuggingFace model hub. Can be tag name, branch name, or commit hash.
         :param use_gpu: Whether to use gpu or not
         :param model_format: Name of framework that was used for saving the model. Options:
 
@@ -399,17 +508,27 @@ class EmbeddingRetriever(BaseRetriever):
                                  - ``'per_token'`` (individual token vectors)
         :param emb_extraction_layer: Number of layer from which the embeddings shall be extracted (for farm / transformers models only).
                                      Default: -1 (very last layer).
+        :param top_k: How many documents to return per query.
         """
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(
+            document_store=document_store, embedding_model=embedding_model, model_version=model_version,
+            use_gpu=use_gpu, model_format=model_format, pooling_strategy=pooling_strategy,
+            emb_extraction_layer=emb_extraction_layer, top_k=top_k,
+        )
+
         self.document_store = document_store
         self.model_format = model_format
         self.pooling_strategy = pooling_strategy
         self.emb_extraction_layer = emb_extraction_layer
+        self.top_k = top_k
 
         if model_format == "farm" or model_format == "transformers":
             logger.info(
                 f"Init retriever using embeddings of model {embedding_model}")
             self.embedding_model = Inferencer.load(
-                embedding_model, task_type="embeddings", extraction_strategy=self.pooling_strategy,
+                embedding_model, revision=model_version, task_type="embeddings", extraction_strategy=self.pooling_strategy,
                 extraction_layer=self.emb_extraction_layer, gpu=use_gpu, batch_size=4, max_seq_len=512, num_processes=0
             )
             # Check that document_store has the right similarity function
@@ -452,8 +571,7 @@ class EmbeddingRetriever(BaseRetriever):
             self.embedding_model = embedding_model
         else:
             raise NotImplementedError
-
-    def retrieve(self, query: str, filters: dict = None, top_k: int = 10, index: str = None) -> List[Document]:
+    def retrieve(self, query: str, filters: dict = None, top_k: Optional[int] = None, index: str = None) -> List[Document]:
         """
         Scan through documents in DocumentStore and return a small number documents
         that are most relevant to the query.
@@ -463,6 +581,8 @@ class EmbeddingRetriever(BaseRetriever):
         :param top_k: How many documents to return per query.
         :param index: The name of the index in the DocumentStore from which to retrieve documents
         """
+        if top_k is None:
+            top_k = self.top_k
         if index is None:
             index = self.document_store.index
         query_emb = self.embed(texts=[query])
@@ -470,7 +590,7 @@ class EmbeddingRetriever(BaseRetriever):
                                                            top_k=top_k, index=index)
         return documents
 
-    def embed(self, texts: Union[List[str], str]) -> List[np.array]:
+    def embed(self, texts: Union[List[List[str]], List[str], str]) -> List[np.ndarray]:
         """
         Create embeddings for each text in a list of texts using the retrievers model (`self.embedding_model`)
 
@@ -489,16 +609,16 @@ class EmbeddingRetriever(BaseRetriever):
             emb = self.embedding_model.inference_from_dicts(dicts=[{"text": t} for t in texts])
             emb = [(r["vec"]) for r in emb]
         elif self.model_format == "sentence_transformers":
-            # text is single string, sentence-transformers needs a list of strings
+            # texts can be a list of strings or a list of [title, text]
             # get back list of numpy embedding vectors
-            emb = self.embedding_model.encode(texts)
+            emb = self.embedding_model.encode(texts, batch_size=200, show_progress_bar=False)
             emb = [r for r in emb]
         elif self.model_format == "self-written":
             pred = self.embedding_model.predict(texts)
             emb = [p for p in pred]
         return emb
 
-    def embed_queries(self, texts: List[str]) -> List[np.array]:
+    def embed_queries(self, texts: List[str]) -> List[np.ndarray]:
         """
         Create embeddings for a list of queries. For this Retriever type: The same as calling .embed()
 
@@ -507,13 +627,15 @@ class EmbeddingRetriever(BaseRetriever):
         """
         return self.embed(texts)
 
-    def embed_passages(self, docs: List[Document]) -> List[np.array]:
+    def embed_passages(self, docs: List[Document]) -> Union[List[str], List[List[str]]]:
         """
         Create embeddings for a list of passages. For this Retriever type: The same as calling .embed()
 
         :param docs: List of documents to embed
         :return: Embeddings, one per input passage
         """
-        texts = [d.text for d in docs]
-
-        return self.embed(texts)
+        if self.model_format == "sentence_transformers":
+            passages = [[d.meta["name"] if d.meta and "name" in d.meta else "", d.text] for d in docs]  # type: ignore
+        else:
+            passages = [d.text for d in docs] # type: ignore
+        return self.embed(passages)

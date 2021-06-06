@@ -1,8 +1,8 @@
 import pandas as pd
 from pathlib import Path
 from time import perf_counter
-from utils import get_document_store, get_retriever, index_to_doc_store, load_config
-from haystack.preprocessor.utils import eval_data_from_file
+from utils import get_document_store, get_retriever, index_to_doc_store, load_config, download_from_url
+from haystack.preprocessor.utils import eval_data_from_json
 from haystack.document_store.faiss import FAISSDocumentStore
 
 from haystack import Document
@@ -15,7 +15,7 @@ import random
 import traceback
 import os
 import requests
-from farm.file_utils import download_from_s3
+from farm.file_utils import http_get
 import json
 from results_to_json import retriever as retriever_json
 from templates import RETRIEVER_TEMPLATE, RETRIEVER_MAP_TEMPLATE, RETRIEVER_SPEED_TEMPLATE
@@ -50,7 +50,7 @@ def benchmark_indexing(n_docs_options, retriever_doc_stores, data_dir, filename_
                 docs, _ = prepare_data(data_dir=data_dir,
                                        filename_gold=filename_gold,
                                        filename_negative=filename_negative,
-                                       data_s3_url=data_s3_url,
+                                       remote_url=data_s3_url,
                                        embeddings_filenames=embeddings_filenames,
                                        embeddings_dir=embeddings_dir,
                                        n_docs=n_docs)
@@ -134,14 +134,18 @@ def benchmark_querying(n_docs_options,
         for retriever_name, doc_store_name in retriever_doc_stores:
             try:
                 logger.info(f"##### Start querying run: {retriever_name}, {doc_store_name}, {n_docs} docs ##### ")
-                doc_store = get_document_store(doc_store_name)
+                if retriever_name in ["elastic", "sentence_transformers"]:
+                    similarity = "cosine"
+                else:
+                    similarity = "dot_product"
+                doc_store = get_document_store(doc_store_name, similarity=similarity)
                 retriever = get_retriever(retriever_name, doc_store)
                 add_precomputed = retriever_name in ["dpr"]
                 # For DPR, precomputed embeddings are loaded from file
                 docs, labels = prepare_data(data_dir=data_dir,
                                             filename_gold=filename_gold,
                                             filename_negative=filename_negative,
-                                            data_s3_url=data_s3_url,
+                                            remote_url=data_s3_url,
                                             embeddings_filenames=embeddings_filenames,
                                             embeddings_dir=embeddings_dir,
                                             n_docs=n_docs,
@@ -160,8 +164,8 @@ def benchmark_querying(n_docs_options,
                     "retrieve_time": raw_results["retrieve_time"],
                     "queries_per_second": raw_results["n_questions"] / raw_results["retrieve_time"],
                     "seconds_per_query": raw_results["retrieve_time"]/ raw_results["n_questions"],
-                    "recall": raw_results["recall"],
-                    "map": raw_results["map"],
+                    "recall": raw_results["recall"] * 100,
+                    "map": raw_results["map"] * 100,
                     "top_k": raw_results["top_k"],
                     "date_time": datetime.datetime.now(),
                     "error": None
@@ -250,7 +254,7 @@ def add_precomputed_embeddings(embeddings_dir, embeddings_filenames, docs):
     return ret
 
 
-def prepare_data(data_dir, filename_gold, filename_negative, data_s3_url,  embeddings_filenames, embeddings_dir, n_docs=None, n_queries=None, add_precomputed=False):
+def prepare_data(data_dir, filename_gold, filename_negative, remote_url, embeddings_filenames, embeddings_dir, n_docs=None, n_queries=None, add_precomputed=False):
     """
     filename_gold points to a squad format file.
     filename_negative points to a csv file where the first column is doc_id and second is document text.
@@ -258,14 +262,14 @@ def prepare_data(data_dir, filename_gold, filename_negative, data_s3_url,  embed
     """
 
     logging.getLogger("farm").setLevel(logging.INFO)
-    download_from_s3(data_s3_url + filename_gold, cache_dir=data_dir)
-    download_from_s3(data_s3_url + filename_negative, cache_dir=data_dir)
+    download_from_url(remote_url + filename_gold, filepath=data_dir + filename_gold)
+    download_from_url(remote_url + filename_negative, filepath=data_dir + filename_negative)
     if add_precomputed:
         for embedding_filename in embeddings_filenames:
-            download_from_s3(data_s3_url + str(embeddings_dir) + embedding_filename, cache_dir=data_dir)
+            download_from_url(remote_url + str(embeddings_dir) + embedding_filename, filepath=data_dir + str(embeddings_dir) + embedding_filename)
     logging.getLogger("farm").setLevel(logging.WARN)
 
-    gold_docs, labels = eval_data_from_file(data_dir + filename_gold)
+    gold_docs, labels = eval_data_from_json(data_dir + filename_gold)
 
     # Reduce number of docs
     gold_docs = gold_docs[:n_docs]

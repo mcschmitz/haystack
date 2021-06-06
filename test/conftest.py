@@ -1,4 +1,3 @@
-import os
 import subprocess
 import time
 from subprocess import run
@@ -7,6 +6,10 @@ from sys import platform
 import pytest
 import requests
 from elasticsearch import Elasticsearch
+from haystack.knowledge_graph.graphdb import GraphDBKnowledgeGraph
+from milvus import Milvus
+
+from haystack.document_store.milvus import MilvusDocumentStore
 from haystack.generator.transformers import RAGenerator, RAGeneratorType
 
 from haystack.retriever.sparse import ElasticsearchFilterOnlyRetriever, ElasticsearchRetriever, TfidfRetriever
@@ -20,16 +23,40 @@ from haystack.document_store.memory import InMemoryDocumentStore
 from haystack.document_store.sql import SQLDocumentStore
 from haystack.reader.farm import FARMReader
 from haystack.reader.transformers import TransformersReader
+from haystack.summarizer.transformers import TransformersSummarizer
+from haystack.translator import TransformersTranslator
+
+
+def _sql_session_rollback(self, attr):
+    """
+    Inject SQLDocumentStore at runtime to do a session rollback each time it is called. This allows to catch
+    errors where an intended operation is still in a transaction, but not committed to the database.
+    """
+    method = object.__getattribute__(self, attr)
+    if callable(method):
+        try:
+            self.session.rollback()
+        except AttributeError:
+            pass
+
+    return method
+
+
+SQLDocumentStore.__getattribute__ = _sql_session_rollback
 
 
 def pytest_collection_modifyitems(items):
     for item in items:
         if "generator" in item.nodeid:
             item.add_marker(pytest.mark.generator)
+        elif "summarizer" in item.nodeid:
+            item.add_marker(pytest.mark.summarizer)
         elif "tika" in item.nodeid:
             item.add_marker(pytest.mark.tika)
         elif "elasticsearch" in item.nodeid:
             item.add_marker(pytest.mark.elasticsearch)
+        elif "graphdb" in item.nodeid:
+            item.add_marker(pytest.mark.graphdb)
         elif "pipeline" in item.nodeid:
             item.add_marker(pytest.mark.pipeline)
         elif "slow" in item.nodeid:
@@ -55,6 +82,43 @@ def elasticsearch_fixture():
         if status.returncode:
             raise Exception(
                 "Failed to launch Elasticsearch. Please check docker container logs.")
+        time.sleep(30)
+
+
+@pytest.fixture(scope="session")
+def milvus_fixture():
+    # test if a Milvus server is already running. If not, start Milvus docker container locally.
+    # Make sure you have given > 6GB memory to docker engine
+    try:
+        milvus_server = Milvus(uri="tcp://localhost:19530", timeout=5, wait_timeout=5)
+        milvus_server.server_status(timeout=5)
+    except:
+        print("Starting Milvus ...")
+        status = subprocess.run(['docker run -d --name milvus_cpu_0.10.5 -p 19530:19530 -p 19121:19121 '
+                                 'milvusdb/milvus:0.10.5-cpu-d010621-4eda95'], shell=True)
+        time.sleep(40)
+
+
+@pytest.fixture(scope="session")
+def graphdb_fixture():
+    # test if a GraphDB instance is already running. If not, download and start a GraphDB instance locally.
+    try:
+        kg = GraphDBKnowledgeGraph()
+        # fail if not running GraphDB
+        kg.delete_index()
+    except:
+        print("Starting GraphDB ...")
+        status = subprocess.run(
+            ['docker rm haystack_test_graphdb'],
+            shell=True
+        )
+        status = subprocess.run(
+            ['docker run -d -p 7200:7200 --name haystack_test_graphdb docker-registry.ontotext.com/graphdb-free:9.4.1-adoptopenjdk11'],
+            shell=True
+        )
+        if status.returncode:
+            raise Exception(
+                "Failed to launch GraphDB. Please check docker container logs.")
         time.sleep(30)
 
 
@@ -95,10 +159,9 @@ def xpdf_fixture(tika_fixture):
             raise Exception(
                 """Currently auto installation of pdftotext is not supported on {0} platform """.format(platform)
             )
-
-        commands = """ wget --no-check-certificate https://dl.xpdfreader.com/xpdf-tools-{0}-4.02.tar.gz &&
-                       tar -xvf xpdf-tools-{0}-4.02.tar.gz &&
-                       {1} cp xpdf-tools-{0}-4.02/bin64/pdftotext /usr/local/bin""".format(platform_id, sudo_prefix)
+        commands = """ wget --no-check-certificate https://dl.xpdfreader.com/xpdf-tools-{0}-4.03.tar.gz &&
+                       tar -xvf xpdf-tools-{0}-4.03.tar.gz &&
+                       {1} cp xpdf-tools-{0}-4.03/bin64/pdftotext /usr/local/bin""".format(platform_id, sudo_prefix)
         run([commands], shell=True)
 
         verify_installation = run(["pdftotext -v"], shell=True)
@@ -114,6 +177,28 @@ def rag_generator():
     return RAGenerator(
         model_name_or_path="facebook/rag-token-nq",
         generator_type=RAGeneratorType.TOKEN
+    )
+
+
+@pytest.fixture(scope="module")
+def summarizer():
+    return TransformersSummarizer(
+        model_name_or_path="google/pegasus-xsum",
+        use_gpu=-1
+    )
+
+
+@pytest.fixture(scope="module")
+def en_to_de_translator():
+    return TransformersTranslator(
+        model_name_or_path="Helsinki-NLP/opus-mt-en-de",
+    )
+
+
+@pytest.fixture(scope="module")
+def de_to_en_translator():
+    return TransformersTranslator(
+        model_name_or_path="Helsinki-NLP/opus-mt-de-en",
     )
 
 
@@ -200,7 +285,8 @@ def get_retriever(retriever_type, document_store):
                                           passage_embedding_model="facebook/dpr-ctx_encoder-single-nq-base",
                                           use_gpu=False, embed_title=True)
     elif retriever_type == "tfidf":
-        return TfidfRetriever(document_store=document_store)
+        retriever = TfidfRetriever(document_store=document_store)
+        retriever.fit()
     elif retriever_type == "embedding":
         retriever = EmbeddingRetriever(
             document_store=document_store,
@@ -217,30 +303,28 @@ def get_retriever(retriever_type, document_store):
     return retriever
 
 
-@pytest.fixture(params=["elasticsearch", "faiss", "memory", "sql"])
+@pytest.fixture(params=["elasticsearch", "faiss", "memory", "sql", "milvus"])
 def document_store_with_docs(request, test_docs_xs):
     document_store = get_document_store(request.param)
     document_store.write_documents(test_docs_xs)
     yield document_store
-    if request.param == "faiss":
-        document_store.faiss_index.reset()
+    document_store.delete_all_documents()
 
 
-@pytest.fixture(params=["elasticsearch", "faiss", "memory", "sql"])
+@pytest.fixture(params=["elasticsearch", "faiss", "memory", "sql", "milvus"])
 def document_store(request, test_docs_xs):
     document_store = get_document_store(request.param)
     yield document_store
-    if request.param == "faiss":
-        document_store.faiss_index.reset()
+    document_store.delete_all_documents()
 
 
 def get_document_store(document_store_type, embedding_field="embedding"):
     if document_store_type == "sql":
-        if os.path.exists("haystack_test.db"):
-            os.remove("haystack_test.db")
-        document_store = SQLDocumentStore(url="sqlite:///haystack_test.db")
+        document_store = SQLDocumentStore(url="sqlite://", index="haystack_test")
     elif document_store_type == "memory":
-        document_store = InMemoryDocumentStore(return_embedding=True, embedding_field=embedding_field)
+        document_store = InMemoryDocumentStore(
+            return_embedding=True, embedding_field=embedding_field, index="haystack_test"
+        )
     elif document_store_type == "elasticsearch":
         # make sure we start from a fresh index
         client = Elasticsearch()
@@ -249,11 +333,24 @@ def get_document_store(document_store_type, embedding_field="embedding"):
             index="haystack_test", return_embedding=True, embedding_field=embedding_field
         )
     elif document_store_type == "faiss":
-        if os.path.exists("haystack_test_faiss.db"):
-            os.remove("haystack_test_faiss.db")
         document_store = FAISSDocumentStore(
-            sql_url="sqlite:///haystack_test_faiss.db", return_embedding=True, embedding_field=embedding_field
+            sql_url="sqlite://",
+            return_embedding=True,
+            embedding_field=embedding_field,
+            index="haystack_test",
         )
+        return document_store
+    elif document_store_type == "milvus":
+        document_store = MilvusDocumentStore(
+            sql_url="sqlite://",
+            return_embedding=True,
+            embedding_field=embedding_field,
+            index="haystack_test",
+        )
+        _, collections = document_store.milvus_server.list_collections()
+        for collection in collections:
+            if collection.startswith("haystack_test"):
+                document_store.milvus_server.drop_collection(collection)
         return document_store
     else:
         raise Exception(f"No document store fixture for '{document_store_type}'")
