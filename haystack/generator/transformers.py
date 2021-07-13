@@ -245,7 +245,7 @@ class RAGenerator(BaseGenerator):
         )
         input_ids = input_dict['input_ids'].to(self.device)
         # Query embedding
-        query_embedding = self.model.question_encoder(input_ids)[0]
+        query_embedding = self.model.query_encoder(input_ids)[0]
 
         # Prepare contextualized input_ids of documents
         # (will be transformed into contextualized inputs inside generator)

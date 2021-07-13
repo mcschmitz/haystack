@@ -168,7 +168,7 @@ class DensePassageRetriever(BaseRetriever):
                     revision=model_version,
                     do_lower_case=True,
                     use_fast=use_fast_tokenizers,
-                    tokenizer_class=tokenizers_default_classes["query"],
+                    # tokenizer_class=tokenizers_default_classes["query"],
                 )
                 self.query_encoder = LanguageModel.load(
                     pretrained_model_name_or_path=query_embedding_model,
@@ -180,7 +180,7 @@ class DensePassageRetriever(BaseRetriever):
                     revision=model_version,
                     do_lower_case=True,
                     use_fast=use_fast_tokenizers,
-                    tokenizer_class=tokenizers_default_classes["passage"],
+                    # tokenizer_class=tokenizers_default_classes["passage"],
                 )
                 self.passage_encoder = LanguageModel.load(
                     pretrained_model_name_or_path=passage_embedding_model,
@@ -329,7 +329,6 @@ class DensePassageRetriever(BaseRetriever):
                             ]
                             passage_batch = {
                                 "input_ids": input_ids,
-                                "token_type_ids": token_type_ids,
                                 "attention_mask": attention_mask,
                             }
                             passage_embeddings = self.passage_encoder.forward(
@@ -341,7 +340,6 @@ class DensePassageRetriever(BaseRetriever):
                             attention_mask = batch["query_attention_mask"]
                             query_batch = {
                                 "input_ids": input_ids,
-                                "token_type_ids": token_type_ids,
                                 "attention_mask": attention_mask,
                             }
                             query_embeddings = self.query_encoder.forward(

@@ -323,7 +323,7 @@ class FARMReader(BaseReader):
                                                  uid=doc.id))
                 inputs.append(cur)
 
-        self.inferencer.batch_size = batch_size
+        self.inferencer.megabatch_size = batch_size
         # make predictions on all document-query pairs
         predictions = self.inferencer.inference_from_objects(
             objects=inputs, return_json=False, multiprocessing_chunksize=10
@@ -429,7 +429,7 @@ class FARMReader(BaseReader):
             data_dir=Path(data_dir),
         )
 
-        data_silo = DataSilo(processor=eval_processor, batch_size=self.inferencer.batch_size, distributed=False)
+        data_silo = DataSilo(processor=eval_processor, batch_size=self.inferencer.megabatch_size, distributed=False)
         data_loader = data_silo.get_data_loader("test")
 
         evaluator = Evaluator(data_loader=data_loader, tasks=eval_processor.tasks, device=device)
@@ -539,7 +539,7 @@ class FARMReader(BaseReader):
         tic = perf_counter()
         indices = range(len(farm_input))
         dataset, tensor_names, problematic_ids = self.inferencer.processor.dataset_from_dicts(farm_input, indices=indices)
-        data_loader = NamedDataLoader(dataset=dataset, batch_size=self.inferencer.batch_size, tensor_names=tensor_names)
+        data_loader = NamedDataLoader(dataset=dataset, batch_size=self.inferencer.megabatch_size, tensor_names=tensor_names)
 
         evaluator = Evaluator(data_loader=data_loader, tasks=self.inferencer.processor.tasks, device=device)
 
